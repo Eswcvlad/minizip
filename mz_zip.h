@@ -50,6 +50,7 @@ typedef struct mz_zip_file_s {
     uint16_t aes_version;               /* winzip aes extension if not 0 */
     uint8_t  aes_encryption_mode;       /* winzip aes encryption mode */
     uint16_t pk_verify;                 /* pkware encryption verifier */
+    int64_t  zip64_compressed_offset;
 
 } mz_zip_file, mz_zip_entry;
 

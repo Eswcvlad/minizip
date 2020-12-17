@@ -521,7 +521,7 @@ static int32_t mz_zip_entry_read_descriptor(void *stream, uint8_t zip64, uint32_
     return err;
 }
 
-static int32_t mz_zip_entry_write_crc_sizes(void *stream, uint8_t mask, mz_zip_file *file_info) {
+static int32_t mz_zip_entry_write_crc_sizes(void *stream, uint8_t zip64, uint8_t mask, mz_zip_file *file_info) {
     int32_t err = MZ_OK;
 
     if (mask)
@@ -530,13 +530,13 @@ static int32_t mz_zip_entry_write_crc_sizes(void *stream, uint8_t mask, mz_zip_f
         err = mz_stream_write_uint32(stream, file_info->crc); /* crc */
 
     if (err == MZ_OK) {
-        if (file_info->compressed_size >= UINT32_MAX) /* compr size */
+        if (zip64 || (file_info->compressed_size >= UINT32_MAX)) /* compr size */
             err = mz_stream_write_uint32(stream, UINT32_MAX);
         else
             err = mz_stream_write_uint32(stream, (uint32_t)file_info->compressed_size);
     }
     if (err == MZ_OK) {
-        if (file_info->uncompressed_size >= UINT32_MAX) /* uncompr size */
+        if (zip64 || (file_info->uncompressed_size >= UINT32_MAX)) /* uncompr size */
             err = mz_stream_write_uint32(stream, UINT32_MAX);
         else if (mask)
             err = mz_stream_write_uint32(stream, 0);
@@ -564,6 +564,7 @@ static int32_t mz_zip_entry_write_header(void *stream, uint8_t local, mz_zip_fil
     int32_t comment_size = 0;
     int32_t err = MZ_OK;
     int32_t err_mem = MZ_OK;
+    uint8_t needs_zip64 = 0;
     uint8_t zip64 = 0;
     uint8_t skip_aes = 0;
     uint8_t mask = 0;
@@ -578,26 +579,28 @@ static int32_t mz_zip_entry_write_header(void *stream, uint8_t local, mz_zip_fil
     if ((local) && (file_info->flag & MZ_ZIP_FLAG_MASK_LOCAL_INFO))
         mask = 1;
 
-    /* Calculate extra field sizes */
-    if (file_info->uncompressed_size >= UINT32_MAX)
-        field_length_zip64 += 8;
-    if (file_info->compressed_size >= UINT32_MAX)
-        field_length_zip64 += 8;
-    if (file_info->disk_offset >= UINT32_MAX)
-        field_length_zip64 += 8;
+    /* Check if we need zip64 */
+    needs_zip64 = (file_info->uncompressed_size >= UINT32_MAX) ||
+                  (file_info->compressed_size >= UINT32_MAX) ||
+                  (file_info->disk_offset >= UINT32_MAX);
 
     if (file_info->zip64 == MZ_ZIP64_AUTO) {
         /* If uncompressed size is unknown, assume zip64 for 64-bit data descriptors */
-        zip64 = (local && file_info->uncompressed_size == 0) || (field_length_zip64 > 0);
+        zip64 = (local && file_info->uncompressed_size == 0) || needs_zip64;
     } else if (file_info->zip64 == MZ_ZIP64_FORCE) {
         zip64 = 1;
     } else if (file_info->zip64 == MZ_ZIP64_DISABLE) {
         /* Zip64 extension is required to zip file */
-        if (field_length_zip64 > 0)
+        if (needs_zip64)
             return MZ_PARAM_ERROR;
     }
 
     if (zip64) {
+        /* Calculate extra field sizes */
+        field_length_zip64 = 16;
+        if (file_info->disk_offset >= UINT32_MAX)
+            field_length_zip64 += 8;
+
         extrafield_size += 4;
         extrafield_size += field_length_zip64;
     }
@@ -699,7 +702,7 @@ static int32_t mz_zip_entry_write_header(void *stream, uint8_t local, mz_zip_fil
     }
 
     if (err == MZ_OK)
-        err = mz_zip_entry_write_crc_sizes(stream, mask, file_info);
+        err = mz_zip_entry_write_crc_sizes(stream, zip64, mask, file_info);
 
     if (mask) {
         snprintf(masked_name, sizeof(masked_name), "%" PRIx32 "_%" PRIx64,
@@ -783,16 +786,21 @@ static int32_t mz_zip_entry_write_header(void *stream, uint8_t local, mz_zip_fil
     /* Write ZIP64 extra field */
     if ((err == MZ_OK) && (zip64)) {
         err = mz_zip_extrafield_write(stream, MZ_ZIP_EXTENSION_ZIP64, field_length_zip64);
-        if ((err == MZ_OK) && (file_info->uncompressed_size >= UINT32_MAX)) {
+        if (err == MZ_OK) {
             if (mask)
                 err = mz_stream_write_int64(stream, 0);
             else
                 err = mz_stream_write_int64(stream, file_info->uncompressed_size);
         }
-        if ((err == MZ_OK) && (file_info->compressed_size >= UINT32_MAX))
+        if (err == MZ_OK) {
+            if (local)
+                file_info->zip64_compressed_offset = mz_stream_tell(stream);
             err = mz_stream_write_int64(stream, file_info->compressed_size);
+        }
         if ((err == MZ_OK) && (file_info->disk_offset >= UINT32_MAX))
             err = mz_stream_write_int64(stream, file_info->disk_offset);
+    } else if (local) {
+        file_info->zip64_compressed_offset = -1;
     }
     /* Write NTFS extra field */
     if ((err == MZ_OK) && (field_length_ntfs > 0)) {
@@ -2115,7 +2123,7 @@ int32_t mz_zip_entry_write_close(void *handle, uint32_t crc32, int64_t compresse
         mz_stream_get_prop_int64(zip->crypt_stream, MZ_STREAM_PROP_TOTAL_OUT, &compressed_size);
     }
 
-    if ((err == MZ_OK) && (zip->file_info.flag & MZ_ZIP_FLAG_DATA_DESCRIPTOR)) {
+    if (err == MZ_OK) {
         /* Determine if we need to write data descriptor in zip64 format,
            if local extrafield was saved with zip64 extrafield */
         if (zip->file_info.zip64 == MZ_ZIP64_AUTO) {
@@ -2131,12 +2139,14 @@ int32_t mz_zip_entry_write_close(void *handle, uint32_t crc32, int64_t compresse
             zip64 = 1;
         }
 
-        if (zip->file_info.flag & MZ_ZIP_FLAG_MASK_LOCAL_INFO)
-            err = mz_zip_entry_write_descriptor(zip->stream,
-                zip64, 0, compressed_size, 0);
-        else
-            err = mz_zip_entry_write_descriptor(zip->stream,
-                zip64, crc32, compressed_size, uncompressed_size);
+        if (zip->file_info.flag & MZ_ZIP_FLAG_DATA_DESCRIPTOR) {
+            if (zip->file_info.flag & MZ_ZIP_FLAG_MASK_LOCAL_INFO)
+                err = mz_zip_entry_write_descriptor(zip->stream,
+                    zip64, 0, compressed_size, 0);
+            else
+                err = mz_zip_entry_write_descriptor(zip->stream,
+                    zip64, crc32, compressed_size, uncompressed_size);
+        }
     }
 
     /* Write file info to central directory */
@@ -2166,7 +2176,15 @@ int32_t mz_zip_entry_write_close(void *handle, uint32_t crc32, int64_t compresse
         }
 
         if (err == MZ_OK)
-            err = mz_zip_entry_write_crc_sizes(zip->stream, 0, &zip->file_info);
+            err = mz_zip_entry_write_crc_sizes(zip->stream, zip64, 0, &zip->file_info);
+
+        /* Updating sizes in the local header zip64 header */
+        if (zip64 && zip->file_info.zip64_compressed_offset != -1) {
+            if (err == MZ_OK)
+                err = mz_stream_seek(zip->stream, zip->file_info.zip64_compressed_offset, MZ_SEEK_SET);
+            if (err == MZ_OK)
+                err = mz_stream_write_int64(zip->stream, zip->file_info.compressed_size);
+        }
 
         mz_stream_set_prop_int64(zip->stream, MZ_STREAM_PROP_DISK_NUMBER, end_disk_number);
         mz_stream_seek(zip->stream, end_pos, MZ_SEEK_SET);
