@@ -126,6 +126,41 @@ typedef struct mz_zip_s {
 
 /***************************************************************************/
 
+static int32_t mz_zip_extrafield_find_limited(void *stream, uint16_t seek_limit, uint16_t type, uint16_t *length) {
+    int32_t err = MZ_OK;
+    uint16_t field_type = 0;
+    uint16_t field_length = 0;
+    int32_t current_seek_limit = seek_limit;
+
+    if (current_seek_limit < 4)
+        return MZ_EXIST_ERROR;
+
+    /* minus first header */
+    current_seek_limit -= 4;
+    do {
+        err = mz_stream_read_uint16(stream, &field_type);
+        if (err == MZ_OK)
+            err = mz_stream_read_uint16(stream, &field_length);
+        if (err != MZ_OK)
+            break;
+
+        if (type == field_type) {
+            if (length != NULL)
+                *length = field_length;
+            return MZ_OK;
+        }
+
+        /* minus field and next header */
+        current_seek_limit -= field_length - 4;
+        if (current_seek_limit < 0)
+            return MZ_EXIST_ERROR;
+
+        err = mz_stream_seek(stream, field_length, MZ_SEEK_CUR);
+    } while (err == MZ_OK);
+
+    return MZ_EXIST_ERROR;
+}
+
 /* Locate the end of central directory */
 static int32_t mz_zip_search_eocd(void *stream, int64_t *central_pos) {
     int64_t file_size = 0;
@@ -2168,7 +2203,7 @@ int32_t mz_zip_entry_write_close(void *handle, uint32_t crc32, int64_t compresse
                 if (filename_size > 0)
                     err = mz_stream_seek(zip->stream, filename_size, MZ_SEEK_CUR);
 
-                if ((err == MZ_OK) && (mz_zip_extrafield_find(zip->stream, MZ_ZIP_EXTENSION_ZIP64, &length) == MZ_OK)) {
+                if ((err == MZ_OK) && (mz_zip_extrafield_find_limited(zip->stream, extrafield_size, MZ_ZIP_EXTENSION_ZIP64, &length) == MZ_OK)) {
                     if (length >= 8)
                         err = mz_stream_write_int64(zip->stream, zip->file_info.uncompressed_size);
                     if ((err == MZ_OK) && (length >= 16))
@@ -2533,27 +2568,7 @@ int32_t mz_zip_attrib_win32_to_posix(uint32_t win32_attrib, uint32_t *posix_attr
 /***************************************************************************/
 
 int32_t mz_zip_extrafield_find(void *stream, uint16_t type, uint16_t *length) {
-    int32_t err = MZ_OK;
-    uint16_t field_type = 0;
-    uint16_t field_length = 0;
-
-    do {
-        err = mz_stream_read_uint16(stream, &field_type);
-        if (err == MZ_OK)
-            err = mz_stream_read_uint16(stream, &field_length);
-        if (err != MZ_OK)
-            break;
-
-        if (type == field_type) {
-            if (length != NULL)
-                *length = field_length;
-            return MZ_OK;
-        }
-
-        err = mz_stream_seek(stream, field_length, MZ_SEEK_CUR);
-    } while (err == MZ_OK);
-
-    return MZ_EXIST_ERROR;
+    return mz_zip_extrafield_find_limited(stream, UINT16_MAX, type, length);
 }
 
 int32_t mz_zip_extrafield_contains(const uint8_t *extrafield, int32_t extrafield_size,
